@@ -1,0 +1,75 @@
+// Cleaning_Log — row counts for every cleaning step, recalculated on every refresh,
+// so the log can never drift away from what the queries actually did.
+// Each source is summarised in ONE grouping pass (not one pass per count) to keep refresh fast.
+let
+    CoreFuels = List.Buffer(Text.Split(Settings[Core_Fuels], ",")),
+    // Each summary is small and used several times below, so it is buffered (computed once)
+    RawSummary = Table.Buffer(Table.Group(
+        Table.AddColumn(Table.SelectColumns(Raw_Combined, {"Source_File", "Had_Spaced_Headers", "SiteId"}),
+            "Is_Blank", each [SiteId] = null or Text.Trim([SiteId]) = "", type logical),
+        {"Source_File", "Had_Spaced_Headers", "Is_Blank"}, {{"Rows", each Table.RowCount(_), Int64.Type}})),
+    CleanSummary = Table.Buffer(Table.Group(
+        Table.AddColumn(Table.SelectColumns(Prices_Clean, {"Fuel_Type", "Price_Status", "Transaction_AEST"}),
+            "Is_Core", each List.Contains(CoreFuels, [Fuel_Type]), type logical),
+        {"Price_Status", "Is_Core"}, {{"Rows", each Table.RowCount(_), Int64.Type},
+            {"Bad_Timestamps", each List.Count(List.Select([Transaction_AEST], each _ = null)), Int64.Type}})),
+    SiteSummary = Table.Buffer(Table.Group(dim_Sites, {"Brand_Changed", "Brand_Group"}, {{"Sites", each Table.RowCount(_), Int64.Type}})),
+    WindowSummary = Table.Buffer(Table.Group(Table.AddColumn(Daily_InEffect, "All", each 1), {"All"}, {
+        {"Windows", each Table.RowCount(_), Int64.Type}, {"Site_Days", each List.Sum([Days_In_Effect]), Int64.Type}})),
+    RawRows       = List.Sum(RawSummary[Rows]),
+    FilesRead     = List.Count(List.Distinct(RawSummary[Source_File])),
+    SpacedFiles   = List.Count(List.Distinct(Table.SelectRows(RawSummary, each [Had_Spaced_Headers])[Source_File])),
+    BlankRows     = List.Sum(Table.SelectRows(RawSummary, each [Is_Blank])[Rows]) ?? 0,
+    NonBlankRows  = RawRows - BlankRows,
+    CleanRows     = List.Sum(CleanSummary[Rows]),
+    BadTimestamps = List.Sum(CleanSummary[Bad_Timestamps]),
+    Stockouts     = List.Sum(Table.SelectRows(CleanSummary, each [Price_Status] = "Stock-out")[Rows]) ?? 0,
+    OutOfRange    = List.Sum(Table.SelectRows(CleanSummary, each [Price_Status] = "Out of range")[Rows]) ?? 0,
+    ValidRows     = CleanRows - Stockouts - OutOfRange,
+    CoreValidRows = List.Sum(Table.SelectRows(CleanSummary, each [Price_Status] = "Valid" and [Is_Core])[Rows]),
+    PricesPerMinute = Table.Group(
+        Table.SelectRows(Table.SelectColumns(Prices_Clean, {"SiteId", "Fuel_Type", "Transaction_AEST", "Price_cpl", "Price_Status"}),
+            each [Price_Status] = "Valid" and List.Contains(CoreFuels, [Fuel_Type])),
+        {"SiteId", "Fuel_Type", "Transaction_AEST"}, {{"Prices", each List.Count(List.Distinct([Price_cpl])), Int64.Type}}),
+    Conflicts     = Table.RowCount(Table.SelectRows(PricesPerMinute, each [Prices] > 1)),
+    WindowRows    = WindowSummary{0}[Windows],
+    SiteDays      = WindowSummary{0}[Site_Days],
+    SitesTotal    = List.Sum(SiteSummary[Sites]),
+    SitesRebrand  = List.Sum(Table.SelectRows(SiteSummary, each [Brand_Changed])[Sites]) ?? 0,
+    SmallBrandSites = List.Sum(Table.SelectRows(SiteSummary, each [Brand_Group] = "Other brands")[Sites]) ?? 0,
+    FactRows      = Table.RowCount(fact_Daily),
+    Log = #table(
+        {"Step", "Action", "Rule applied", "Rows in", "Rows out", "Rows affected", "Why"},
+        {
+            {1, "Combine monthly files", Text.From(FilesRead) & " CSV files from the data folder", null, RawRows, null,
+                "One table for the full 12 months (Sep 2025 - Aug 2026)"},
+            {2, "Standardise column headers", "Replace spaces with underscores in column names", RawRows, RawRows, SpacedFiles,
+                "Files affected. One monthly file used 'Site Brand' instead of 'Site_Brand'; without this fix its columns would load empty"},
+            {3, "Remove blank rows", "Drop rows with no SiteId", RawRows, NonBlankRows, BlankRows,
+                "Most monthly files end with an empty line"},
+            {4, "Parse timestamps, convert UTC to Brisbane time", "UTC + " & Text.From(Settings[UTC_Offset_Hours]) & " hours (no daylight saving in QLD)", NonBlankRows, NonBlankRows, BadTimestamps,
+                "Rows that failed to parse. A change at 11pm UTC belongs to the next calendar day in Brisbane"},
+            {5, "Remove duplicate price events", "Same site, fuel, price and timestamp", NonBlankRows, CleanRows, NonBlankRows - CleanRows,
+                "Duplicates would double-count a price change"},
+            {6, "Flag stock-outs", "Price code " & Text.From(Settings[Stockout_Code]) & " = fuel temporarily unavailable", CleanRows, CleanRows, Stockouts,
+                "Not a real price: excluded from averages, analysed separately as supply stress"},
+            {7, "Flag out-of-range prices", "Below " & Text.From(Settings[Min_Valid_cpl]) & " or above " & Text.From(Settings[Max_Valid_cpl]) & " cents per litre", CleanRows, ValidRows, OutOfRange,
+                "Data-entry errors (e.g. a missing digit); excluded from averages"},
+            {8, "Keep core fuels", Settings[Core_Fuels], ValidRows, CoreValidRows, ValidRows - CoreValidRows,
+                "Premium fuels, LPG and E85 excluded to keep comparisons like-for-like"},
+            {9, "Resolve same-minute conflicts", "Two different prices for the same site and fuel in the same minute: keep the lower", CoreValidRows, CoreValidRows, Conflicts,
+                "Timestamps are to the minute, so the order is unknown; usually a typo corrected seconds later (e.g. 495.9c then 195.9c)"},
+            {10, "Keep last price of each day", "One price per site, fuel and day (the latest change)", CoreValidRows, WindowRows, CoreValidRows - WindowRows,
+                "Some sites change price several times a day; the closing price is the one in effect overnight"},
+            {11, "Use latest site details", "One row per site from its most recent record", null, SitesTotal, SitesRebrand,
+                "Sites that changed brand or name during the year (e.g. Caltex to Ampol)"},
+            {12, "Group small brands", "Top " & Text.From(Settings[Top_Brands]) & " brands by number of sites kept; the rest = 'Other brands'", SitesTotal, SitesTotal, SmallBrandSites,
+                "Sites moved to 'Other brands' (Brand_Group column; the original Brand is kept)"},
+            {13, "Carry prices forward to every day", "Each price holds until the day before the next change", WindowRows, SiteDays, null,
+                "Source records only changes; daily in-effect prices weight every site equally"},
+            {14, "Aggregate for analysis", "Sum of prices and site-days by Date x Fuel x Brand x Region", SiteDays, FactRows, null,
+                "Fits on a worksheet; averages stay exact via SUM(Price_Sum)/SUM(Site_Days)"}
+        }),
+    Typed = Table.TransformColumnTypes(Log, {{"Step", Int64.Type}, {"Rows in", Int64.Type}, {"Rows out", Int64.Type}, {"Rows affected", Int64.Type}})
+in
+    Typed
